@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <defs>
+    <linearGradient id="bg2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f5f7ff"/>
+      <stop offset="100%" stop-color="#e3edff"/>
+    </linearGradient>
+    <linearGradient id="accent2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6f56ff"/>
+      <stop offset="50%" stop-color="#23c3ff"/>
+      <stop offset="100%" stop-color="#7f7dff"/>
+    </linearGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect width="200" height="200" rx="32" fill="url(#bg2)"/>
+  <g filter="url(#soft)">
+    <path d="M50,100 C50,70 50,56 66,56 C75,56 81,64 85,78 C89,64 95,56 104,56 C120,56 120,70 120,100" fill="none" stroke="url(#accent2)" stroke-width="14" stroke-linecap="round"/>
+    <path d="M42,100 C42,88 42,82 50,82 C58,82 58,88 58,100" fill="none" stroke="#85c8ff" stroke-width="10" stroke-linecap="round"/>
+    <path d="M126,100 C126,88 126,82 118,82 C110,82 110,88 110,100" fill="none" stroke="#85c8ff" stroke-width="10" stroke-linecap="round"/>
+    <path d="M62,58 L62,34 C62,28 68,24 74,24 H126 C132,24 138,28 138,34 L138,58" fill="none" stroke="url(#accent2)" stroke-width="12" stroke-linecap="round"/>
+    <path d="M76,58 L76,76" fill="none" stroke="#4ed1ff" stroke-width="5" stroke-linecap="round"/>
+    <path d="M124,58 L124,76" fill="none" stroke="#4ed1ff" stroke-width="5" stroke-linecap="round"/>
+    <path d="M82,72 L118,72" fill="none" stroke="#4ed1ff" stroke-width="5" stroke-linecap="round" opacity="0.7"/>
+    <line x1="82" y1="84" x2="82" y2="100" stroke="#60c8ff" stroke-width="4" stroke-linecap="round"/>
+    <line x1="118" y1="84" x2="118" y2="100" stroke="#60c8ff" stroke-width="4" stroke-linecap="round"/>
+    <path d="M74,42 Q86,30 98,42" fill="none" stroke="#8288ff" stroke-width="4" stroke-linecap="round"/>
+    <path d="M102,42 Q114,30 126,42" fill="none" stroke="#8288ff" stroke-width="4" stroke-linecap="round"/>
+  </g>
+  <text x="100" y="175" text-anchor="middle" font-family="Inter, sans-serif" font-size="20" fill="#090c1f" font-weight="700">HarmonyAI</text>
+</svg>
