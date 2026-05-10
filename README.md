@@ -16,7 +16,7 @@ A Python-based hybrid music recommendation system with Streamlit UI and supporti
 1. Create a virtual environment:
    ```bash
    python -m venv venv
-   source venv/Scripts/activate  # Windows
+   venv\Scripts\activate
    ```
 2. Install dependencies:
    ```bash
@@ -29,10 +29,17 @@ A Python-based hybrid music recommendation system with Streamlit UI and supporti
 
 ## GitLab setup
 
-1. Create a GitLab project.
-2. Add the GitLab remote and push:
+1. Create the GitLab project.
+2. Connect the local repo:
    ```bash
-   git remote add origin <your-gitlab-repo-url>
+   git remote add origin https://gitlab.com/enigma-group/music-recommendation-system.git
    git branch -M main
+   ```
+3. Push your code:
+   ```bash
    git push -u origin main
    ```
+
+## Contributing
+
+Invite your teammates on GitLab under **Project > Members** and use branches + merge requests to collaborate.
