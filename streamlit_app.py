@@ -7,10 +7,18 @@ import pandas as pd
 import numpy as np
 import requests
 import re
+from datetime import datetime
 from io import BytesIO
+from email.message import EmailMessage
+from email.utils import make_msgid
+import smtplib
 from PIL import Image
 import time
 import base64
+from urllib.parse import quote_plus
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, MetaData, Table, Column, String, DateTime, Boolean, select
+from sqlalchemy.exc import SQLAlchemyError
 from hybrid_recommender_validation import (
     load_dataset,
     create_text_features,
@@ -23,23 +31,157 @@ from hybrid_recommender_validation import (
     MODEL_DIR,
 )
 
-import base64
-from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    pg_user = os.getenv("POSTGRES_USER", "").strip()
+    pg_pass = os.getenv("POSTGRES_PASSWORD", "").strip()
+    pg_host = os.getenv("POSTGRES_HOST", "localhost").strip()
+    pg_port = os.getenv("POSTGRES_PORT", "5432").strip()
+    pg_db = os.getenv("POSTGRES_DB", "music_recommender").strip()
+    if pg_user and pg_pass:
+        DATABASE_URL = f"postgresql+psycopg2://{pg_user}:{pg_pass}@{pg_host}:{pg_port}/{pg_db}"
+
+DB_ENGINE = None
+DB_METADATA = MetaData()
+users_table = Table(
+    "users",
+    DB_METADATA,
+    Column("email", String, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("password", String, nullable=False),
+    Column("is_admin", Boolean, default=False, nullable=False),
+    Column("created_at", DateTime, default=datetime.utcnow),
+)
+
+if DATABASE_URL:
+    try:
+        DB_ENGINE = create_engine(DATABASE_URL, echo=False, future=True)
+    except SQLAlchemyError:
+        DB_ENGINE = None
 
 # --- Embedded auth helpers (restored from auth.py) ---
-USERS_FILE = Path("users_db.json")
+USERS_FILE = BASE_DIR / "users_db.json"
+USER_PROFILE_DIR = BASE_DIR / "user_profiles"
+DEFAULT_AVATAR_PATH = BASE_DIR / "Gemini_Generated_Image_i0gnofi0gnofi0gn.png"
 
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
 
+def _profile_hash(email: str) -> str:
+    return hashlib.sha256(email.lower().encode("utf-8")).hexdigest()
+
+
+def _profile_meta_path(email: str) -> Path:
+    return USER_PROFILE_DIR / f"{_profile_hash(email)}.json"
+
+
+def _profile_avatar_path(email: str) -> Path:
+    return USER_PROFILE_DIR / f"{_profile_hash(email)}.png"
+
+
+def ensure_profile_dir() -> None:
+    USER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_user_profile(email: str) -> dict:
+    ensure_profile_dir()
+    profile = {"memo": "", "avatar": ""}
+    meta_path = _profile_meta_path(email)
+    if meta_path.exists():
+        try:
+            profile.update(json.loads(meta_path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return profile
+
+
+def save_user_profile(email: str, memo: str | None = None, avatar_bytes: bytes | None = None) -> None:
+    ensure_profile_dir()
+    profile = load_user_profile(email)
+    if memo is not None:
+        profile["memo"] = memo
+    if avatar_bytes is not None:
+        avatar_path = _profile_avatar_path(email)
+        try:
+            with avatar_path.open("wb") as f:
+                f.write(avatar_bytes)
+            profile["avatar"] = str(avatar_path.name)
+        except Exception:
+            pass
+    profile["updated_at"] = datetime.utcnow().isoformat()
+    meta_path = _profile_meta_path(email)
+    try:
+        meta_path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def get_avatar_data_uri(email: str | None = None) -> str:
+    avatar_path = None
+    if email:
+        candidate = _profile_avatar_path(email)
+        if candidate.exists():
+            avatar_path = candidate
+    if avatar_path is None and DEFAULT_AVATAR_PATH.exists():
+        avatar_path = DEFAULT_AVATAR_PATH
+    if not avatar_path or not avatar_path.exists():
+        return ""
+    try:
+        with Image.open(avatar_path) as img:
+            img = img.convert("RGBA")
+            img = img.resize((120, 120), Image.LANCZOS)
+            buffer = BytesIO()
+            img.save(buffer, format="PNG", optimize=True)
+            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return f"data:image/png;base64,{encoded}"
+    except Exception:
+        return ""
+
+
+def get_query_params() -> dict:
+    if hasattr(st, "query_params"):
+        return dict(st.query_params)
+    if hasattr(st, "experimental_get_query_params"):
+        return st.experimental_get_query_params()
+    return {}
+
+
+def set_query_params(params: dict) -> None:
+    if hasattr(st, "query_params"):
+        st.query_params = params
+    elif hasattr(st, "experimental_set_query_params"):
+        st.experimental_set_query_params(**params)
+
+
 def init_user_store() -> None:
+    if DB_ENGINE is not None:
+        try:
+            DB_METADATA.create_all(DB_ENGINE)
+        except SQLAlchemyError:
+            pass
+        return
+
     if not USERS_FILE.exists():
         USERS_FILE.write_text(json.dumps({"users": {}}, indent=2))
 
 
 def load_users() -> dict:
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.connect() as conn:
+                result = conn.execute(select(users_table)).mappings().all()
+                return {
+                    row["email"]: {"name": row["name"], "password": row["password"]}
+                    for row in result
+                }
+        except SQLAlchemyError:
+            return {}
+
     try:
         init_user_store()
         with USERS_FILE.open('r', encoding='utf-8') as f:
@@ -50,14 +192,45 @@ def load_users() -> dict:
 
 
 def save_users(users: dict) -> None:
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.begin() as conn:
+                for email_key, user_data in users.items():
+                    conn.execute(
+                        users_table.insert().values(
+                            email=email_key,
+                            name=user_data.get('name', email_key),
+                            password=user_data.get('password', ''),
+                            created_at=datetime.utcnow(),
+                        )
+                    )
+        except SQLAlchemyError:
+            pass
+        return
+
     USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with USERS_FILE.open('w', encoding='utf-8') as f:
         json.dump({"users": users}, f, indent=2)
 
 
 def authenticate_user(email: str, password: str) -> tuple:
+    email_key = email.lower()
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.connect() as conn:
+                result = conn.execute(
+                    select(users_table).where(users_table.c.email == email_key)
+                ).mappings().first()
+                if not result:
+                    return False, "No account found for that email."
+                if result["password"] != hash_password(password):
+                    return False, "Incorrect password."
+                return True, result["name"] or email
+        except SQLAlchemyError:
+            pass
+
     users = load_users()
-    stored = users.get(email.lower())
+    stored = users.get(email_key)
     if not stored:
         return False, "No account found for that email."
     if stored.get('password') != hash_password(password):
@@ -65,9 +238,45 @@ def authenticate_user(email: str, password: str) -> tuple:
     return True, stored.get('name', email)
 
 
-def register_user(name: str, email: str, password: str) -> tuple:
-    users = load_users()
+def user_exists(email: str) -> bool:
     email_key = email.lower()
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.connect() as conn:
+                return conn.execute(
+                    select(users_table.c.email).where(users_table.c.email == email_key)
+                ).first() is not None
+        except SQLAlchemyError:
+            pass
+
+    users = load_users()
+    return email_key in users
+
+
+def register_user(name: str, email: str, password: str) -> tuple:
+    email_key = email.lower()
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.connect() as conn:
+                result = conn.execute(
+                    select(users_table).where(users_table.c.email == email_key)
+                ).first()
+                if result:
+                    return False, "An account using that email already exists."
+                conn.execute(
+                    users_table.insert().values(
+                        email=email_key,
+                        name=name.strip() or email_key,
+                        password=hash_password(password),
+                        created_at=datetime.utcnow(),
+                    )
+                )
+                conn.commit()
+                return True, "Account created successfully."
+        except SQLAlchemyError as exc:
+            return False, f"Failed to register account: {exc}"
+
+    users = load_users()
     if email_key in users:
         return False, "An account using that email already exists."
     users[email_key] = {'name': name.strip() or email_key, 'password': hash_password(password)}
@@ -75,9 +284,247 @@ def register_user(name: str, email: str, password: str) -> tuple:
     return True, "Account created successfully."
 
 
+def update_user_name(email: str, new_name: str) -> tuple[bool, str]:
+    email_key = email.lower()
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.begin() as conn:
+                result = conn.execute(
+                    select(users_table).where(users_table.c.email == email_key)
+                ).first()
+                if not result:
+                    return False, "No account found for that email."
+                conn.execute(
+                    users_table.update()
+                    .where(users_table.c.email == email_key)
+                    .values(name=new_name.strip() or email_key)
+                )
+            return True, "Name updated successfully."
+        except SQLAlchemyError as exc:
+            return False, f"Failed to update name: {exc}"
+
+    users = load_users()
+    if email_key not in users:
+        return False, "No account found for that email."
+    users[email_key]['name'] = new_name.strip() or email_key
+    save_users(users)
+    return True, "Name updated successfully."
+
+
+def check_if_admin(email: str) -> bool:
+    email_key = email.lower()
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.connect() as conn:
+                result = conn.execute(
+                    select(users_table.c.is_admin).where(users_table.c.email == email_key)
+                ).scalar()
+                return bool(result) if result is not None else False
+        except SQLAlchemyError:
+            pass
+    users = load_users()
+    user_rec = users.get(email_key, {})
+    return bool(user_rec.get('is_admin', False))
+
+
+def set_admin_status(email: str, is_admin: bool) -> tuple[bool, str]:
+    email_key = email.lower()
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.begin() as conn:
+                result = conn.execute(
+                    select(users_table).where(users_table.c.email == email_key)
+                ).first()
+                if not result:
+                    return False, "No account found for that email."
+                conn.execute(
+                    users_table.update()
+                    .where(users_table.c.email == email_key)
+                    .values(is_admin=is_admin)
+                )
+            return True, f"Admin status updated for {email_key}."
+        except SQLAlchemyError as exc:
+            return False, f"Failed to update admin status: {exc}"
+    
+    users = load_users()
+    if email_key not in users:
+        return False, "No account found for that email."
+    users[email_key]['is_admin'] = is_admin
+    save_users(users)
+    return True, f"Admin status updated for {email_key}."
+
+
+def delete_user(email: str) -> tuple[bool, str]:
+    email_key = email.lower()
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.begin() as conn:
+                result = conn.execute(
+                    select(users_table).where(users_table.c.email == email_key)
+                ).first()
+                if not result:
+                    return False, "User not found."
+                conn.execute(
+                    users_table.delete().where(users_table.c.email == email_key)
+                )
+            return True, f"User {email_key} deleted."
+        except SQLAlchemyError as exc:
+            return False, f"Failed to delete user: {exc}"
+    
+    users = load_users()
+    if email_key not in users:
+        return False, "User not found."
+    users.pop(email_key)
+    save_users(users)
+    return True, f"User {email_key} deleted."
+
+
+def get_all_users_list() -> list:
+    if DB_ENGINE is not None:
+        try:
+            with DB_ENGINE.connect() as conn:
+                result = conn.execute(select(users_table)).mappings().all()
+                return [{"email": row["email"], "name": row["name"], "is_admin": bool(row["is_admin"])} for row in result]
+        except SQLAlchemyError:
+            pass
+    users = load_users()
+    return [{"email": k, "name": v.get("name", k), "is_admin": bool(v.get("is_admin", False))} for k, v in users.items()]
+
+
 def validate_email(email: str) -> bool:
     pattern = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
     return re.match(pattern, email.strip()) is not None
+
+
+def get_query_params() -> dict:
+    if hasattr(st, "query_params"):
+        return dict(st.query_params)
+    if hasattr(st, "experimental_get_query_params"):
+        return st.experimental_get_query_params()
+    return {}
+
+
+def set_query_params(params: dict) -> None:
+    if hasattr(st, "query_params"):
+        st.query_params = params
+    elif hasattr(st, "experimental_set_query_params"):
+        st.experimental_set_query_params(**params)
+
+
+OTP_EXPIRY_SECONDS = 300
+
+
+def generate_otp_code() -> str:
+    return str(np.random.randint(0, 1000000)).zfill(6)
+
+
+def clear_otp_state() -> None:
+    for key in [
+        'otp_pending',
+        'otp_code',
+        'otp_expires',
+        'pending_signup_name',
+        'pending_signup_email',
+        'pending_signup_password',
+        'pending_signup_confirm',
+        'signup_otp_input',
+        'otp_message',
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def is_otp_valid(code: str) -> bool:
+    if not st.session_state.get('otp_code'):
+        return False
+    if time.time() > st.session_state.get('otp_expires', 0):
+        return False
+    return str(code).strip() == st.session_state.get('otp_code')
+
+
+def send_otp_notification(email: str, otp: str) -> tuple[bool, str]:
+    smtp_server = os.getenv("SMTP_SERVER", "")
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
+    smtp_user = os.getenv("SMTP_USERNAME", "")
+    smtp_pass = os.getenv("SMTP_PASSWORD", "")
+    from_address = os.getenv("EMAIL_FROM", smtp_user)
+
+    if not smtp_server or not smtp_user or not smtp_pass or not from_address:
+        return False, "SMTP settings are not configured. Set SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, and EMAIL_FROM."
+
+    sender_name = "Music Recommendation System"
+    message = EmailMessage()
+    message["Subject"] = "Your OTP code for Music Recommendation System"
+    message["From"] = f"{sender_name} <{from_address}>"
+    message["To"] = email
+
+    logo_path = BASE_DIR / "wangdalockedin.jpeg"
+    logo_cid = None
+    logo_bytes = None
+    if logo_path.exists():
+        logo_bytes = logo_path.read_bytes()
+        logo_cid = make_msgid(domain="example.com")[1:-1]
+
+    plain_text = (
+        f"Your one-time verification code is {otp}.\n\n"
+        "It will expire in 5 minutes. Do not share it with anyone.\n\n"
+        "If you did not request this, please ignore this message.\n"
+    )
+    message.set_content(plain_text)
+
+    img_tag = f'<img src="cid:{logo_cid}" alt="Music Recommendation System" width="120" style="display:block;margin:0 auto 16px;" />' if logo_cid else ''
+
+    html_content = f"""
+    <html>
+      <body style="font-family:Arial,Helvetica,sans-serif;background:#f4f6fb;padding:0;margin:0;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 20px 40px rgba(0,0,0,0.08);">
+          <tr style="background:#0d9488;color:#ffffff;">
+            <td style="padding:24px;text-align:center;">
+              {img_tag}
+              <h1 style="margin:0;font-size:24px;letter-spacing:0.01em;">Music Recommendation System</h1>
+              <p style="margin:8px 0 0;font-size:14px;color:#d1faf4;">Your secure one-time login code</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px;">
+              <h2 style="margin:0 0 16px;color:#111827;font-size:20px;">Hello,</h2>
+              <p style="margin:0 0 24px;color:#374151;font-size:15px;line-height:1.7;">Use the code below to verify your account and finish the signup process.</p>
+              <div style="text-align:center;margin:0 auto 24px;padding:22px 0;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:14px;max-width:240px;font-size:32px;letter-spacing:4px;font-weight:700;color:#065f46;">
+                {otp}
+              </div>
+              <p style="margin:0 0 12px;color:#4b5563;font-size:14px;">This code expires in <strong>5 minutes</strong>.</p>
+              <p style="margin:0 0 24px;color:#4b5563;font-size:14px;">If you did not request this code, you can safely ignore this message.</p>
+              <p style="margin:0;color:#6b7280;font-size:12px;">Music Recommendation System • Sent from {from_address}</p>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+    """
+
+    message.add_alternative(html_content, subtype="html")
+    if logo_cid and logo_bytes is not None:
+        message.get_payload()[1].add_related(
+            logo_bytes,
+            maintype="image",
+            subtype="jpeg",
+            cid=f"<{logo_cid}>",
+            filename="wangdalockedin.jpeg",
+        )
+
+    try:
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15) as smtp:
+                smtp.login(smtp_user, smtp_pass)
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=15) as smtp:
+                smtp.starttls()
+                smtp.login(smtp_user, smtp_pass)
+                smtp.send_message(message)
+        return True, "OTP sent successfully. Check your email inbox."
+    except Exception as exc:
+        return False, f"Failed to send OTP email: {exc}"
 
 
 def show_auth_page() -> None:
@@ -429,46 +876,98 @@ def show_auth_page() -> None:
                     else:
                         success, message = authenticate_user(email, password)
                         if success:
+                            is_admin = check_if_admin(email.lower())
                             st.session_state.authenticated = True
                             st.session_state.current_user = message
+                            st.session_state.current_email = email.lower()
                             st.session_state.auth_loading = True
+                            # Admin users go to Admin console; ensure admins bypass onboarding
+                            if is_admin:
+                                st.session_state.current_page = "Admin"
+                                st.session_state.onboarding_complete = True
+                                st.success(f"Welcome back, admin {message}! Redirecting to Admin console...")
+                                set_query_params({"page": ["Admin"]})
+                                time.sleep(0.6)
+                                st.rerun()
+                            # Regular users land on Home and go through onboarding
+                            st.session_state.current_page = "Home"
+                            st.session_state.onboarding_complete = False
+                            st.session_state.onboarding_data = {}
                             st.success(f"Welcome back, {message}! Preparing your music feed...")
                             st.info("Loading your dashboard now... just a moment.")
                             time.sleep(0.8)
+                            set_query_params({})
                             st.rerun()
                         else:
                             st.error(message)
 
         with tabs[1]:
             st.session_state.auth_mode = "Sign up"
-            with st.form("auth_signup_form"):
-                name = st.text_input("Full name", key="signup_name")
-                email = st.text_input("Email address", key="signup_email")
-                password = st.text_input("Password", type="password", key="signup_password")
-                confirm = st.text_input("Confirm password", type="password", key="signup_confirm")
-                st.caption("Use at least 8 characters with letters, numbers, and a symbol for the best security.")
-                submit = st.form_submit_button("Create account")
-                if submit:
-                    if not name or not email or not password or not confirm:
-                        st.error("All fields are required to create an account.")
-                    elif not validate_email(email):
-                        st.error("Enter a valid email address.")
-                    elif password != confirm:
-                        st.error("Passwords do not match.")
-                    elif len(password) < 8:
-                        st.error("Password should be at least 8 characters.")
-                    else:
-                        success, message = register_user(name, email, password)
-                        if success:
-                            st.success("Account created successfully. Please log in now.")
-                            st.session_state.auth_mode = "Login"
-                            st.session_state.auth_message = message
-                            st.session_state.auth_loading = True
-                            st.info("Taking you to the login screen...")
-                            time.sleep(0.8)
-                            st.rerun()
+            if not st.session_state.otp_pending:
+                with st.form("auth_signup_form"):
+                    name = st.text_input("Full name", key="signup_name")
+                    email = st.text_input("Email address", key="signup_email")
+                    password = st.text_input("Password", type="password", key="signup_password")
+                    confirm = st.text_input("Confirm password", type="password", key="signup_confirm")
+                    st.caption("Use at least 8 characters with letters, numbers, and a symbol for the best security.")
+                    send_otp = st.form_submit_button("Send OTP")
+                    if send_otp:
+                        if not name or not email or not password or not confirm:
+                            st.error("All fields are required to create an account.")
+                        elif not validate_email(email):
+                            st.error("Enter a valid email address.")
+                        elif password != confirm:
+                            st.error("Passwords do not match.")
+                        elif len(password) < 8:
+                            st.error("Password should be at least 8 characters.")
+                        elif user_exists(email):
+                            st.error("An account using that email already exists. Please log in or use a different email.")
                         else:
-                            st.error(message)
+                            otp = generate_otp_code()
+                            success, message = send_otp_notification(email, otp)
+                            if not success:
+                                st.error(message)
+                            else:
+                                st.session_state.otp_pending = True
+                                st.session_state.otp_code = otp
+                                st.session_state.otp_expires = time.time() + OTP_EXPIRY_SECONDS
+                                st.session_state.pending_signup_name = name
+                                st.session_state.pending_signup_email = email
+                                st.session_state.pending_signup_password = password
+                                st.session_state.pending_signup_confirm = confirm
+                                st.session_state.otp_message = f"OTP sent to {email}. It expires in 5 minutes."
+                                st.success(st.session_state.otp_message)
+                                st.rerun()
+            else:
+                with st.form("auth_signup_verify_form"):
+                    st.markdown("#### Verify your account with OTP")
+                    st.markdown(f"<p style='color:#cbd5e1;'>We sent a one-time password to <strong>{st.session_state.pending_signup_email}</strong>. Enter it below to complete registration.</p>", unsafe_allow_html=True)
+                    otp_input = st.text_input("One-time password", key="signup_otp_input")
+                    verify = st.form_submit_button("Verify OTP")
+                    if verify:
+                        if not otp_input:
+                            st.error("Please enter the OTP to continue.")
+                        elif time.time() > st.session_state.otp_expires:
+                            st.error("OTP expired. Please restart the signup process.")
+                            clear_otp_state()
+                        elif not is_otp_valid(otp_input):
+                            st.error("The OTP is incorrect. Please try again.")
+                        else:
+                            name = st.session_state.pending_signup_name
+                            email = st.session_state.pending_signup_email
+                            password = st.session_state.pending_signup_password
+                            success, message = register_user(name, email, password)
+                            clear_otp_state()
+                            if success:
+                                st.success("Account created successfully. Please log in now.")
+                                st.session_state.auth_mode = "Login"
+                                st.session_state.auth_message = message
+                                st.session_state.auth_loading = True
+                                st.info("Taking you to the login screen...")
+                                time.sleep(0.8)
+                                st.rerun()
+                            else:
+                                st.error(message)
 
         if st.session_state.get('auth_message'):
             st.info(st.session_state['auth_message'])
@@ -481,6 +980,349 @@ def show_auth_page() -> None:
 
 # Ensure user store exists
 init_user_store()
+
+
+def show_onboarding_page():
+    st.markdown(
+        """
+        <style>
+            .onboard-shell {
+                background: linear-gradient(135deg, rgba(29,185,84,0.18), rgba(58,123,213,0.18));
+                border-radius: 2rem;
+                padding: 2rem;
+                box-shadow: 0 32px 90px rgba(10, 25, 47, 0.18);
+                color: #e2e8f0;
+            }
+            .onboard-header h1 { margin:0; font-size:3rem; line-height:1.05; }
+            .onboard-header p { color:#cbd5e1; font-size:1.1rem; margin-top:0.8rem; }
+            .onboard-card { background: rgba(15, 23, 42, 0.88); border: 1px solid rgba(148, 163, 184, 0.12); border-radius: 1.5rem; padding: 1.75rem; margin-bottom: 1.5rem; }
+            .onboard-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+            .onboard-note { background: rgba(30, 41, 59, 0.75); border-radius: 1.25rem; padding: 1.25rem; border: 1px solid rgba(255,255,255,0.08); }
+            .onboard-note h3 { margin-top:0; color:#f8fafc; }
+            .onboard-note p { margin-bottom:0.8rem; color:#cbd5e1; }
+            .onboard-button { background: #10b981 !important; color: #fff !important; border-radius: 999px !important; padding: 1rem 1.4rem !important; font-weight: 700 !important; }
+            .onboard-button:hover { background: #14b8a6 !important; }
+            @media (max-width: 900px) { .onboard-grid { grid-template-columns: 1fr; } }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="onboard-shell">', unsafe_allow_html=True)
+    st.markdown('<div class="onboard-header">', unsafe_allow_html=True)
+    st.markdown('<h1>Tell us your vibe.</h1>', unsafe_allow_html=True)
+    st.markdown('<p>We create a richer recommendation experience when we know your mood, genre, and the music attributes you love.</p>', unsafe_allow_html=True)
+    st.markdown('</div>')
+
+    with st.form('onboarding_form'):
+        st.markdown(
+            '<div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem;">'
+            '<span style="background:#0f172a;color:#a5f3fc;padding:0.65rem 1rem;border-radius:999px;box-shadow:0 10px 30px rgba(16,185,129,0.14);">🎧 Personalize my vibe</span>'
+            '<span style="background:#0f172a;color:#fde68a;padding:0.65rem 1rem;border-radius:999px;box-shadow:0 10px 30px rgba(56,189,248,0.12);">✨ Quick setup</span>'
+            '<span style="background:#0f172a;color:#fbcfe8;padding:0.65rem 1rem;border-radius:999px;box-shadow:0 10px 30px rgba(234,179,8,0.12);">💡 Spotify-style feel</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown('<div class="onboard-grid">', unsafe_allow_html=True)
+        with st.container():
+            mood = st.selectbox(
+                'How are you feeling right now?',
+                ['🧘 Chill & mellow', '⚡ Energetic & upbeat', '❤️ Romantic & warm', '🌧️ Moody & reflective', '🎯 Focused & motivated'],
+                key='onboard_mood',
+            )
+            
+            df_temp = load_data()
+            available_genres = sorted([g for g in df_temp['genre'].dropna().unique() if isinstance(g, str)])
+            genre_display = [f"🎵 {g.title()}" for g in available_genres]
+            
+            genre = st.selectbox(
+                'Choose your genre vibe',
+                genre_display,
+                key='onboard_genre',
+            )
+            tempo = st.slider('Preferred tempo (BPM)', 60, 180, 112, step=5, key='onboard_tempo')
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="onboard-grid">', unsafe_allow_html=True)
+        with st.container():
+            era = st.radio(
+                'Which era sounds best to you?',
+                ['Today ✨', '90s/00s 🔥', 'Classics 🎼', 'Underground 🎙️'],
+                index=0,
+                horizontal=True,
+                key='onboard_era',
+            )
+            focus = st.selectbox(
+                'Your music mission',
+                ['Discover fresh tracks ✨', 'Curate a mood playlist 🎶', 'Hear crowd favorites 🔥', 'Find hidden gems 💎'],
+                key='onboard_focus',
+            )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="onboard-note">', unsafe_allow_html=True)
+        st.markdown('<h3>Why this matters</h3>', unsafe_allow_html=True)
+        st.markdown('<p>These preferences let the recommender start your session with a stronger sense of vibe. You can still refine the experience inside the app at any time.</p>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        submit = st.form_submit_button("Let\'s go listen")
+        if submit:
+            genre_clean = genre.replace("🎵 ", "").lower()
+            st.session_state.onboarding_data = {
+                'Mood': mood,
+                'Genre': genre_clean,
+                'Tempo': tempo,
+                'Era': era,
+                'Focus': focus,
+            }
+            st.session_state.onboarding_complete = True
+            st.success('Your music profile is ready. Redirecting to your recommendation studio...')
+            st.caption('You can still update your listening preferences inside the app when you want to explore a different vibe.')
+            time.sleep(0.9)
+            st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def show_profile_page():
+    user_email = st.session_state.current_email or "Not available"
+    st.markdown("<div style='display:flex;justify-content:space-between;align-items:center;gap:1rem;margin-bottom:1rem;'>", unsafe_allow_html=True)
+    if st.button("← Back to studio", key="profile_back_top"):
+        st.session_state.current_page = "Home"
+        set_query_params({})
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='padding:1.5rem;border-radius:1.8rem;background:linear-gradient(135deg, rgba(15,23,42,0.96), rgba(30,41,59,0.96));box-shadow:0 28px 65px rgba(0,0,0,0.22);'>", unsafe_allow_html=True)
+    # top avatar above greeting
+    avatar_src = get_avatar_data_uri(user_email)
+    st.markdown(f"<div style='display:flex;justify-content:center;margin-bottom:0.6rem;'><img src=\"{avatar_src}\" style='width:120px;height:120px;border-radius:50%;object-fit:cover;border:3px solid rgba(255,255,255,0.06);' alt='avatar'/></div>", unsafe_allow_html=True)
+    st.markdown(f"<h1 style='margin:0;color:#ffffff;font-size:2.4rem;text-align:center;'>Hello, {st.session_state.current_user}</h1>", unsafe_allow_html=True)
+    st.markdown(f"<p style='margin:.75rem 0 0;color:#cbd5e1;font-size:1rem;'>Your music profile puts your listening preferences, avatar, and notes in one refined place.</p>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    profile = load_user_profile(user_email) if user_email != "Not available" else {"memo": "", "avatar": ""}
+    profile_memo = profile.get("memo", "")
+    updated_at = profile.get("updated_at", "Never")
+    # preferences may come from onboarding stored in session state
+    user_prefs = st.session_state.get("onboarding_data", {})
+
+    st.markdown("<div style='margin-top:1rem;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem;'>", unsafe_allow_html=True)
+    st.markdown(f"<div style='padding:1.2rem;border-radius:1.5rem;background:rgba(15,23,42,0.95);border:1px solid rgba(59,130,246,0.18);'><p style='margin:0;color:#94a3b8;'>Signed in as</p><h3 style='margin:.5rem 0 0;color:#ffffff;font-size:1.1rem;'>{user_email}</h3></div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='padding:1.2rem;border-radius:1.5rem;background:rgba(15,23,42,0.95);border:1px solid rgba(16,185,129,0.18);'><p style='margin:0;color:#94a3b8;'>Display name</p><h3 style='margin:.5rem 0 0;color:#ffffff;font-size:1.1rem;'>{st.session_state.current_user}</h3></div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='padding:1.2rem;border-radius:1.5rem;background:rgba(15,23,42,0.95);border:1px solid rgba(244,63,94,0.18);'><p style='margin:0;color:#94a3b8;'>Last updated</p><h3 style='margin:.5rem 0 0;color:#ffffff;font-size:1.1rem;'>{updated_at}</h3></div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    profile_memo = profile.get("memo", "")
+
+    st.markdown("<div style='margin-top:1rem;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem;'>", unsafe_allow_html=True)
+    stats = [
+        ("Profile note", "Saved" if profile_memo else "Empty", "rgba(59,130,246,0.18)"),
+        ("Favorite genre", user_prefs.get("Genre", "Not set"), "rgba(16,185,129,0.18)"),
+        ("Listening focus", f"{user_prefs.get('Focus', 'Not set')} · {user_prefs.get('Era', 'Not set')} · {user_prefs.get('Tempo', 'Not set')} BPM", "rgba(244,63,94,0.18)"),
+    ]
+    for title, value, border in stats:
+        st.markdown(
+            f"<div style='padding:1.2rem;border-radius:1.5rem;background:rgba(15,23,42,0.95);border:1px solid {border};'>"
+            f"<p style='margin:0;color:#94a3b8;'>{title}</p>"
+            f"<h3 style='margin:.5rem 0 0;color:#ffffff;font-size:1.1rem;'>{value}</h3>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.form("profile_form"):
+        st.markdown("<div style='margin-top:1.5rem;display:grid;grid-template-columns:1.6fr 1fr;gap:1.5rem;'>", unsafe_allow_html=True)
+        with st.container():
+            display_name = st.text_input("Display name", value=st.session_state.current_user)
+            memo = st.text_area(
+                "Personal memo",
+                value=profile_memo,
+                height=210,
+                help="Write your musical goals, mood directions, or listening notes for your next session.",
+            )
+            if profile_memo:
+                st.markdown(
+                    "<div style='margin-top:1rem;padding:1rem;border-radius:1.25rem;background:rgba(15,23,42,0.8);border:1px solid rgba(100,116,139,0.16);'>"
+                    "<strong>Your memo</strong>"
+                    f"<p style='margin:.5rem 0 0;color:#cbd5e1;'>{profile_memo}</p>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    "<div style='margin-top:1rem;padding:1rem;border-radius:1.25rem;background:rgba(15,23,42,0.8);border:1px solid rgba(100,116,139,0.16);'>"
+                    "<p style='margin:0;color:#cbd5e1;'>Add a memo so your next session remembers your mood and goals.</p>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+        with st.container():
+            st.markdown("<div style='padding:1.25rem;border-radius:1.5rem;background:rgba(7,10,20,0.88);border:1px solid rgba(100,116,139,0.18);'>", unsafe_allow_html=True)
+            st.markdown("<h3 style='color:#e2e8f0;margin-bottom:0.75rem;'>Profile avatar</h3>", unsafe_allow_html=True)
+            st.image(get_avatar_data_uri(user_email), width=200, caption="Current avatar")
+            uploaded_file = st.file_uploader(
+                "Upload a new avatar",
+                type=["png", "jpg", "jpeg"],
+                help="Choose an image to personalize your profile.",
+            )
+            if uploaded_file is not None:
+                st.markdown("<div style='margin-top:1rem;color:#cbd5e1;'>Preview</div>", unsafe_allow_html=True)
+                st.image(uploaded_file, width=200)
+            st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            save = st.form_submit_button("Save profile")
+        with col2:
+            reset = st.form_submit_button("Reset avatar")
+
+        if save:
+            if not display_name.strip():
+                st.error("Display name cannot be empty.")
+            else:
+                if user_email != "Not available":
+                    save_user_profile(user_email, memo=memo, avatar_bytes=uploaded_file.read() if uploaded_file else None)
+                st.session_state.current_user = display_name.strip()
+                st.success("Profile updated successfully.")
+                st.rerun()
+        if reset:
+            if user_email != "Not available":
+                avatar_path = _profile_avatar_path(user_email)
+                if avatar_path.exists():
+                    avatar_path.unlink()
+                save_user_profile(user_email, memo=memo)
+                st.success("Avatar reset to default.")
+                st.rerun()
+
+    st.markdown("<div style='margin-top:1.5rem;padding:1rem;border-radius:1.5rem;background:rgba(15,23,42,0.88);border:1px solid rgba(100,116,139,0.18);'>", unsafe_allow_html=True)
+    if st.button("Back to recommendation studio", key="profile_back"):
+        st.session_state.current_page = "Home"
+        set_query_params({})
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def show_admin_page():
+    user_email = st.session_state.current_email or ""
+    is_admin = check_if_admin(user_email)
+    if not is_admin:
+        st.error("Access denied — admin credentials required.")
+        if st.button("Back to studio"):
+            st.session_state.current_page = "Home"
+            set_query_params({})
+            st.rerun()
+        return
+
+    st.markdown("<div style='display:flex;justify-content:space-between;align-items:center;gap:1rem;margin-bottom:1rem;'>", unsafe_allow_html=True)
+    if st.button("← Back to studio", key="admin_back_top"):
+        st.session_state.current_page = "Home"
+        set_query_params({})
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='padding:1.2rem;border-radius:1.2rem;background:linear-gradient(135deg, rgba(8,10,20,0.96), rgba(20,28,44,0.96));box-shadow:0 20px 50px rgba(0,0,0,0.28);'>", unsafe_allow_html=True)
+    st.markdown(f"<h1 style='margin:0;color:#fff;font-size:2rem;'>Admin Console</h1>", unsafe_allow_html=True)
+    st.markdown(f"<p style='margin:.5rem 0 0;color:#94a3b8;'>Manage users, view dataset stats, and perform administrative actions.</p>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # User management
+    st.subheader("User Management")
+    with st.expander("View and filter users", expanded=True):
+        users_list = get_all_users_list()
+        df_users = pd.DataFrame(users_list)
+        filter_text = st.text_input("Search users (email or name)")
+        if filter_text:
+            df_users = df_users[df_users["email"].str.contains(filter_text, case=False) | df_users["name"].str.contains(filter_text, case=False)]
+        st.dataframe(df_users.reset_index(drop=True))
+
+    st.markdown("---")
+
+    with st.form("add_user_form"):
+        st.markdown("### Add new user")
+        new_name = st.text_input("Full name", key="admin_new_name")
+        new_email = st.text_input("Email", key="admin_new_email")
+        new_password = st.text_input("Password", type="password", key="admin_new_password")
+        new_is_admin = st.checkbox("Grant admin privileges", key="admin_new_is_admin")
+        submit_add = st.form_submit_button("Create user")
+        if submit_add:
+            if not new_email or not validate_email(new_email):
+                st.error("Enter a valid email for the new user.")
+            elif user_exists(new_email):
+                st.error("A user with that email already exists.")
+            else:
+                success, msg = register_user(new_name.strip() or new_email, new_email, new_password or "password123")
+                if success:
+                    if new_is_admin:
+                        set_admin_status(new_email, True)
+                    st.success(f"Created user {new_email.lower()}.")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.markdown("---")
+
+    # Delete users
+    st.subheader("Delete users")
+    users_list = get_all_users_list()
+    emails = sorted([u["email"] for u in users_list])
+    to_delete = st.multiselect("Select users to delete", options=emails)
+    if to_delete:
+        if st.button("Delete selected users"):
+            for e in to_delete:
+                # prevent deleting self
+                if e == user_email.lower():
+                    st.warning(f"Skipping deletion of current admin account: {e}")
+                    continue
+                delete_user(e)
+            st.success("Selected users deleted.")
+            st.rerun()
+
+    st.markdown("---")
+
+    # Manage admin status
+    st.subheader("Admin privileges")
+    users_list = get_all_users_list()
+    admin_options = {u["email"]: u for u in users_list}
+    selected_user = st.selectbox("Select user", options=sorted(admin_options.keys()))
+    if selected_user:
+        current_admin_status = admin_options[selected_user]["is_admin"]
+        new_admin_status = st.checkbox(f"Grant admin privileges to {selected_user}", value=current_admin_status)
+        if st.button("Update admin status"):
+            if new_admin_status != current_admin_status:
+                success, msg = set_admin_status(selected_user, new_admin_status)
+                if success:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+            else:
+                st.info("No changes made.")
+
+    st.markdown("---")
+
+    # Dataset stats
+    st.subheader("Dataset statistics")
+    try:
+        df = load_data()
+        st.markdown("**Top artists**")
+        top_artists = df['artist'].value_counts().head(10)
+        st.bar_chart(top_artists)
+        st.markdown("**Top songs**")
+        top_songs = df['song_key'].value_counts().head(10)
+        st.bar_chart(top_songs)
+
+        st.markdown("**Artist table**")
+        artist_table = top_artists.reset_index(name='count').rename(columns={"index": "artist"})
+        st.table(artist_table)
+
+        st.markdown("**Song table**")
+        song_table = top_songs.reset_index(name='count').rename(columns={"index": "song"})
+        st.table(song_table)
+    except Exception as e:
+        st.error(f"Unable to load dataset for stats: {e}")
 
 
 @st.cache_data(show_spinner=False)
@@ -528,6 +1370,39 @@ def build_available_songs(df_content):
 def build_user_options(df_cf):
     user_ids = sorted(df_cf['user_id'].unique())
     return ["New user (cold start)"] + [str(uid) for uid in user_ids]
+
+
+def normalize_onboarding_genre(genre_value):
+    if not genre_value:
+        return None
+    return genre_value.lower().strip()
+
+
+def find_genre_seed_song(df_content, genre_value):
+    genre_key = normalize_onboarding_genre(genre_value)
+    if not genre_key:
+        return None
+    genre_mask = df_content['genre'].fillna('').str.lower() == genre_key
+    filtered = df_content[genre_mask]
+    if filtered.empty:
+        return None
+    filtered = filtered.sort_values(['popularity', 'song_name'], ascending=[False, True])
+    return filtered.iloc[0]['song_name']
+
+
+def apply_onboarding_seed(df_content):
+    if st.session_state.get('seed_song_applied'):
+        return
+    if not st.session_state.onboarding_data:
+        return
+    genre = st.session_state.onboarding_data.get('Genre')
+    if not genre:
+        st.session_state.seed_song_applied = True
+        return
+    default_song = find_genre_seed_song(df_content, genre)
+    if default_song:
+        st.session_state.song_title = default_song
+    st.session_state.seed_song_applied = True
 
 
 def parse_user_selection(selection):
@@ -799,12 +1674,64 @@ if "auth_message" not in st.session_state:
     st.session_state.auth_message = ""
 if "auth_loading" not in st.session_state:
     st.session_state.auth_loading = False
+if "otp_pending" not in st.session_state:
+    st.session_state.otp_pending = False
+if "otp_code" not in st.session_state:
+    st.session_state.otp_code = None
+if "otp_expires" not in st.session_state:
+    st.session_state.otp_expires = 0
+if "otp_message" not in st.session_state:
+    st.session_state.otp_message = ""
+if "onboarding_complete" not in st.session_state:
+    st.session_state.onboarding_complete = False
+if "onboarding_data" not in st.session_state:
+    st.session_state.onboarding_data = {}
+if "seed_song_applied" not in st.session_state:
+    st.session_state.seed_song_applied = False
+if "current_email" not in st.session_state:
+    st.session_state.current_email = ""
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "Home"
 
 if not st.session_state.authenticated:
     show_auth_page()
     st.stop()
 
+if not st.session_state.onboarding_complete:
+    show_onboarding_page()
+    st.stop()
+
+params = get_query_params()
+if params.get("page"):
+    page_param = params.get("page")
+    st.session_state.current_page = page_param[0] if isinstance(page_param, list) else page_param
+
+if st.session_state.current_page == "Profile":
+    show_profile_page()
+    st.stop()
+
+if st.session_state.current_page == "Admin":
+    show_admin_page()
+    st.stop()
+
 st.title(f"Welcome back, {st.session_state.current_user} 🎶")
+if st.session_state.onboarding_data:
+    prefs = st.session_state.onboarding_data
+    with st.container():
+        st.markdown("<div style='padding:1.3rem;border-radius:1.5rem;background:linear-gradient(135deg, rgba(16,185,129,0.16), rgba(59,130,246,0.15));border:1px solid rgba(59,130,246,0.18);'>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;'>"
+            f"<div style='padding:1rem;border-radius:1rem;background:rgba(15,23,42,0.85);'><strong>Mood</strong><div style='margin-top:0.5rem;color:#d1fae5;'>{prefs['Mood']}</div></div>"
+            f"<div style='padding:1rem;border-radius:1rem;background:rgba(15,23,42,0.85);'><strong>Genre</strong><div style='margin-top:0.5rem;color:#c7d2fe;'>{prefs['Genre']}</div></div>"
+            f"<div style='padding:1rem;border-radius:1rem;background:rgba(15,23,42,0.85);'><strong>Focus</strong><div style='margin-top:0.5rem;color:#fce7f3;'>{prefs['Focus']}</div></div>"
+            f"<div style='padding:1rem;border-radius:1rem;background:rgba(15,23,42,0.85);'><strong>Era</strong><div style='margin-top:0.5rem;color:#c7f9cc;'>{prefs['Era']}</div></div>"
+            f"<div style='padding:1rem;border-radius:1rem;background:rgba(15,23,42,0.85);'><strong>Tempo</strong><div style='margin-top:0.5rem;color:#fde68a;'>{prefs['Tempo']} BPM</div></div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
 st.markdown(
     "## The most dynamic hybrid recommender experience for your music library"
 )
@@ -822,19 +1749,55 @@ with st.spinner(spinner_text):
 st.session_state.auth_loading = False
 
 with st.sidebar:
+    avatar_src = get_avatar_data_uri(st.session_state.current_email or None)
+    if avatar_src:
+        avatar_html = f'''
+            <div style="width:88px;height:88px;border-radius:50%;margin:0 auto 1rem auto;
+            background:linear-gradient(135deg,#1db954,#1ed760);display:flex;align-items:center;justify-content:center;
+            box-shadow:0 18px 40px rgba(0,0,0,0.25);cursor:pointer;overflow:hidden;">
+                <img src="{avatar_src}" width="88" height="88" style="object-fit:cover;display:block;" />
+            </div>
+        '''
+    else:
+        avatar_html = '''
+            <div style="width:88px;height:88px;border-radius:50%;margin:0 auto 1rem auto;
+            background:linear-gradient(135deg,#1db954,#1ed760);display:flex;align-items:center;justify-content:center;
+            box-shadow:0 18px 40px rgba(0,0,0,0.25);cursor:pointer;">
+                <span style="font-size:2.4rem;color:#ffffff;">🎧</span>
+            </div>
+        '''
+    st.markdown(avatar_html, unsafe_allow_html=True)
+    if st.button("Open profile", key="open_profile"):
+        st.session_state.current_page = "Profile"
+        set_query_params({"page": ["Profile"]})
+        st.rerun()
+    st.markdown('<div style="text-align:center;color:#94a3b8;margin-bottom:0.75rem;">Tap the avatar or press "Open profile" to edit your account.</div>', unsafe_allow_html=True)
     st.markdown(f"### Signed in as **{st.session_state.current_user}**")
     if st.button("Sign out"):
         st.session_state.authenticated = False
         st.session_state.current_user = "Guest"
+        st.session_state.current_email = ""
+        st.session_state.current_page = "Home"
         st.session_state.auth_message = "You have signed out successfully."
+        st.session_state.onboarding_complete = False
+        st.session_state.onboarding_data = {}
+        st.session_state.seed_song_applied = False
         st.rerun()
 
     st.markdown("---")
     st.header("Recommendation controls")
     mode = st.radio("Mode", ["Content-based", "Collaborative", "Hybrid"], index=2)
 
-    if "song_title" not in st.session_state:
-        st.session_state.song_title = song_options[0]
+    if "song_title" not in st.session_state or not st.session_state.seed_song_applied:
+        default_song = song_options[0]
+        if st.session_state.onboarding_data and st.session_state.onboarding_data.get('Genre'):
+            onboard_genre = st.session_state.onboarding_data.get('Genre')
+            genre_song = find_genre_seed_song(df_content, onboard_genre)
+            if genre_song and genre_song in song_options:
+                default_song = genre_song
+        st.session_state.song_title = default_song
+        st.session_state.seed_song_applied = True
+    
     if "user_selection" not in st.session_state:
         st.session_state.user_selection = user_options[0]
     if "generate_recommendations" not in st.session_state:
