@@ -2,3 +2,8 @@ pandas
 scikit-learn
 matplotlib
 streamlit
+python-dotenv
+SQLAlchemy
+psycopg2-binary
+fastapi
+uvicorn[standard]
