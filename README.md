@@ -27,6 +27,8 @@ A Python-based hybrid music recommendation system with Streamlit UI and supporti
    streamlit run streamlit_app.py
    ```
 
+> The Streamlit UI now includes a polished login and signup page to access the music recommender experience.
+
 ## GitLab setup
 
 1. Create the GitLab project.
