@@ -2,7 +2,7 @@
 title: "Wangda Recommendation System"
 emoji: "🎵"
 colorFrom: "blue"
-colorTo: "teal"
+colorTo: "indigo"
 sdk: "docker"
 sdk_version: "0.50.2"
 python_version: "3.10"
