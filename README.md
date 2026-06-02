@@ -2,6 +2,18 @@
 
 A Python-based hybrid music recommendation system with Streamlit UI and supporting model code.
 
+---
+title: "Wangda Recommendation System"
+emoji: "🎵"
+colorFrom: "blue"
+colorTo: "teal"
+sdk: "docker"
+sdk_version: "0.50.2"
+python_version: "3.10"
+app_file: src/streamlit_app.py
+pinned: false
+---
+
 ## Project structure
 
 - `music_recommender_app.py` - main recommendation logic
