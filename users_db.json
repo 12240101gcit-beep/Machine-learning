@@ -4,13 +4,14 @@
       "name": "Ata Wangda",
       "password": "c495d6475e6554ad5ffb66185e7d698e3413c71cee69ed34a8d84f660835322a"
     },
-    "miksangyolmo684@gmail.com": {
-      "name": "migsang yolmo",
-      "password": "79afcfb0e88e3ade12b3ad5819ea3367f488ff578cacd893cc5c07ef624283fc"
-    },
     "tsheringwangda51@gmail.com": {
       "name": "Tshering Wangda",
       "password": "c495d6475e6554ad5ffb66185e7d698e3413c71cee69ed34a8d84f660835322a"
+    },
+    "yeshiwangmoparo@gmail.com": {
+      "name": "Yeshi Wangmo",
+      "password": "c495d6475e6554ad5ffb66185e7d698e3413c71cee69ed34a8d84f660835322a",
+      "is_admin": true
     }
   }
 }
