@@ -1,7 +1,3 @@
-# Hybrid Music Recommendation System
-
-A Python-based hybrid music recommendation system with Streamlit UI and supporting model code.
-
 ---
 title: "Wangda Recommendation System"
 emoji: "🎵"
@@ -13,6 +9,10 @@ python_version: "3.10"
 app_file: src/streamlit_app.py
 pinned: false
 ---
+
+# Hybrid Music Recommendation System
+
+A Python-based hybrid music recommendation system with Streamlit UI and supporting model code.
 
 ## Project structure
 
