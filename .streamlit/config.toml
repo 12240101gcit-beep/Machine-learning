@@ -15,8 +15,8 @@ level = "error"
 [server]
 headless = true
 maxUploadSize = 200
-enableXsrfProtection = true
-enableCORS = false
+enableXsrfProtection = false
+enableCORS = true
 
 [browser]
 gatherUsageStats = false
