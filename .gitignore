@@ -24,3 +24,8 @@ Thumbs.db
 # IDE/project files
 .vscode/
 .idea/
+
+# Local data and model artifacts
+models/
+user_profiles/
+*.db

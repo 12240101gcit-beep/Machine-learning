@@ -1,9 +1,12 @@
 pandas
+numpy
 scikit-learn
 matplotlib
 streamlit
 python-dotenv
 SQLAlchemy
 psycopg2-binary
+Pillow
+requests
 fastapi
 uvicorn[standard]
