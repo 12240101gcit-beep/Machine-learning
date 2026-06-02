@@ -6,7 +6,7 @@ colorTo: "indigo"
 sdk: "docker"
 sdk_version: "0.50.2"
 python_version: "3.10"
-app_file: src/streamlit_app.py
+app_file: streamlit_app.py
 pinned: false
 ---
 
